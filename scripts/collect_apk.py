@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""AndroidForge — APK Collection.
-
-After the build step completes, search the project tree for generated APK/AAB
-files, select the most relevant one, rename it clearly, and copy it into a
-clean output directory ready for `actions/upload-artifact`.
-
-Selection priority (highest first):
-  1. `*-release.apk`  (release builds preferred over debug)
-  2. `*-debug.apk`
-  3. any other `*.apk`
-  4. `*.aab` (app bundle) as fallback
-
-Files in `build/intermediates/` are skipped — those are intermediate outputs.
-"""
+"""AndroidForge — APK Collection. After the build step completes, search the project tree for generated APK/AAB files, select the most relevant one, rename it clearly, and copy it into a clean output directory ready for `actions/upload-artifact`. Selection priority (highest first): 1. `*-release.apk` (release builds preferred over debug) 2. `*-debug.apk` 3. any other `*.apk` 4. `*.aab` (app bundle) as fallback Files in `build/intermediates/` are skipped — those are intermediate outputs. """
 from __future__ import annotations
 
 import argparse
@@ -24,25 +11,37 @@ from pathlib import Path
 from typing import Any
 
 
-def is_relevant_apk(path: Path) -> bool:
-    """Skip intermediate APKs and only keep outputs under outputs/apk/."""
-    parts = path.parts
-    if "intermediates" in parts:
-        return False
-    return True
-
-
-def find_apks(root: Path) -> list[Path]:
-    apks: list[Path] = []
+def is_relevant_apk(path: Path, output_dir: Path | None = None) -> bool:
+    """Ignore intermediate/cache files and the collector's own output."""
     try:
-        for p in root.rglob("*.apk"):
-            if is_relevant_apk(p):
-                apks.append(p)
-        for p in root.rglob("*.aab"):
-            apks.append(p)
-    except Exception as e:
-        print(f"WARNING: error while scanning for APKs: {e}", file=sys.stderr)
-    return sorted(set(apks), key=lambda p: str(p))
+        resolved = path.resolve()
+        if output_dir is not None and (resolved == output_dir.resolve() or output_dir.resolve() in resolved.parents):
+            return False
+    except Exception:
+        pass
+    ignored = {"intermediates", ".gradle", ".git", "node_modules", ".dart_tool", ".pub-cache", "caches"}
+    return not any(part.lower() in ignored for part in path.parts)
+
+
+def find_apks(root: Path, extra_roots: list[Path] | None = None, output_dir: Path | None = None) -> list[Path]:
+    """Search the project and workspace, because some project layouts emit outputs in sibling folders."""
+    candidates: set[Path] = set()
+    roots = [root]
+    if extra_roots:
+        roots.extend(extra_roots)
+    for scan_root in roots:
+        if not scan_root.exists() or not scan_root.is_dir():
+            print(f"WARNING: APK search root does not exist: {scan_root}", file=sys.stderr)
+            continue
+        try:
+            for p in scan_root.rglob("*"):
+                if not p.is_file() or p.suffix.lower() not in {".apk", ".aab"}:
+                    continue
+                if is_relevant_apk(p, output_dir):
+                    candidates.add(p.resolve())
+        except Exception as e:
+            print(f"WARNING: error while scanning {scan_root} for APKs: {e}", file=sys.stderr)
+    return sorted(candidates, key=lambda p: str(p))
 
 
 def priority(p: Path) -> int:
@@ -85,7 +84,17 @@ def main() -> int:
     for p in output_dir.glob("*.aab"):
         p.unlink()
 
-    apks = find_apks(root)
+    # Search the extracted project first, then the repository workspace as a
+    # fallback for projects whose build scripts write outputs outside project_root.
+    extra_roots: list[Path] = []
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if workspace:
+        extra_roots.append(Path(workspace).resolve())
+    apks = find_apks(root, extra_roots=extra_roots, output_dir=output_dir)
+    print(f"APK collector searched: {[str(root), *[str(p) for p in extra_roots]]}", flush=True)
+    print(f"APK/AAB candidates found: {len(apks)}", flush=True)
+    for candidate in apks:
+        print(f" candidate: {candidate}", flush=True)
     preferred = None
     if args.variant != "auto":
         preferred = args.variant
@@ -124,6 +133,7 @@ def main() -> int:
         "primary": primary_info,
         "all_apks": collected,
         "output_directory": str(output_dir),
+        "search_roots": [str(root), *[str(p) for p in extra_roots]],
     }
     output = json.dumps(result, indent=2)
     if args.output_json:
@@ -141,6 +151,8 @@ def main() -> int:
                 f.write(f"primary_apk_name={primary_info['output_name']}\n")
             f.write(f"json<<EOF\n{json.dumps(result)}\nEOF\n")
 
+    if not collected:
+        print("ERROR: No APK/AAB was found. Check the Build project log for the actual build command and output path.", file=sys.stderr)
     return 0 if collected else 1
 
 
