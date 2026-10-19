@@ -279,7 +279,7 @@ jobs:
             /root/.gradle/caches
             /root/.gradle/wrapper
             ${{ steps.extract.outputs.project_root }}/.gradle
-          key: gradle-${{ steps.toolchain.outputs.gradle_version }}-${{ hashFiles('**/build.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          key: gradle-${{ steps.toolchain.outputs.gradle_version }}
           restore-keys: |
             gradle-${{ steps.toolchain.outputs.gradle_version }}-
             gradle-
