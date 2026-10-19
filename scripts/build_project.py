@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
-"""AndroidForge — Build Project.
-
-Reads detection + setup JSON and runs the appropriate build command(s) for the
-project. The script is non-destructive: it never modifies source files, only
-runs commands in the project directory.
-
-Strategy:
-  1. If Flutter → `flutter pub get` then `flutter build apk`.
-  2. Otherwise → run gradle tasks (assembleDebug, assembleRelease, bundleDebug)
-     in order until one succeeds. Stop on first success.
-  3. If the gradle wrapper is missing/corrupt, regenerate it with
-     `gradle wrapper --gradle-version <X>` first.
-  4. On success, write the produced command + log path to GITHUB_OUTPUT.
-  5. On failure, exit non-zero so the workflow runs the diagnosis step.
-
-The build is run inside the project root directory and inherits the runner's
-PATH (which includes the JDK and Gradle installed by previous workflow steps).
-"""
+"""AndroidForge — Build Project. Reads detection + setup JSON and runs the appropriate build command(s) for the project. The script is non-destructive: it never modifies source files, only runs commands in the project directory. Strategy: 1. If Flutter → `flutter pub get` then `flutter build apk`. 2. Otherwise → run gradle tasks (assembleDebug, assembleRelease, bundleDebug) in order until one succeeds. Stop on first success. 3. If the gradle wrapper is missing/corrupt, regenerate it with `gradle wrapper --gradle-version <X>` first. 4. On success, write the produced command + log path to GITHUB_OUTPUT. 5. On failure, exit non-zero so the workflow runs the diagnosis step. The build is run inside the project root directory and inherits the runner's PATH (which includes the JDK and Gradle installed by previous workflow steps). """
 from __future__ import annotations
 
 import argparse
@@ -33,8 +16,8 @@ def run(cmd: list[str], cwd: Path, log_file: Path, env: dict[str, str] | None = 
     """Run a command, stream stdout/stderr to console AND a log file."""
     log_file.parent.mkdir(parents=True, exist_ok=True)
     print(f"\n=== Running: {' '.join(cmd)}", flush=True)
-    print(f"    cwd: {cwd}", flush=True)
-    print(f"    log: {log_file}", flush=True)
+    print(f" cwd: {cwd}", flush=True)
+    print(f" log: {log_file}", flush=True)
     start = time.time()
     full_env = os.environ.copy()
     if env:
@@ -76,6 +59,28 @@ def maybe_regenerate_wrapper(project_root: Path, gradle_version: str | None, log
     rc, _ = run(cmd, project_root, log_dir / "regenerate-wrapper.log")
     return rc == 0 and jar.exists()
 
+
+
+def has_package_artifact(root: Path) -> bool:
+    """Return True only when a real APK/AAB exists after a build command."""
+    ignored = {"intermediates", ".gradle", ".git", "node_modules", ".dart_tool", ".pub-cache", "caches"}
+    roots = [root]
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if workspace:
+        workspace_path = Path(workspace).resolve()
+        if workspace_path not in roots:
+            roots.append(workspace_path)
+    for scan_root in roots:
+        if not scan_root.exists():
+            continue
+        try:
+            for path in scan_root.rglob("*"):
+                if path.is_file() and path.suffix.lower() in {".apk", ".aab"}:
+                    if not any(part.lower() in ignored for part in path.parts):
+                        return True
+        except Exception as exc:
+            print(f"WARNING: artifact validation scan failed for {scan_root}: {exc}", flush=True)
+    return False
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="AndroidForge build project")
@@ -178,7 +183,7 @@ def main() -> int:
                 except Exception:
                     pass
                 # Replace ["/path/to/gradlew", "assembleDebug"] with
-                #                ["/bin/sh", "/path/to/gradlew", "assembleDebug"]
+                # ["/bin/sh", "/path/to/gradlew", "assembleDebug"]
                 # This makes the build resilient to filesystems that
                 # silently drop the exec bit.
                 cmd = ["/bin/sh", str(gradlew_path)] + cmd[1:]
@@ -186,9 +191,16 @@ def main() -> int:
         last_rc = rc
         last_log = log
         if rc == 0:
-            success = True
-            successful_command = cmd
-            break
+            if has_package_artifact(root):
+                success = True
+                successful_command = cmd
+                print("✓ Build command succeeded and an APK/AAB artifact exists.", flush=True)
+                break
+            print(
+                "⚠ Build command returned success, but no APK/AAB was found yet; "
+                "trying the next configured build command.",
+                flush=True,
+            )
 
     # Output JSON summary
     result = {
@@ -200,6 +212,7 @@ def main() -> int:
         "log_file": last_log,
         "prep_commands_run": prep_commands,
         "build_commands_attempted": all_commands,
+        "artifact_found": has_package_artifact(root) if success else False,
     }
     output = json.dumps(result, indent=2)
     if args.output:
