@@ -5,20 +5,20 @@ name: Build Android APK
 # This workflow uses the PREBUILT Docker image published to GHCR by
 # .github/workflows/build-android-image.yml, so it does NOT reinstall
 # the JDK / Android SDK / Gradle / Flutter on every run. The image is:
-# ghcr.io/<owner>/androidforge-build-env:latest
+#   ghcr.io/<owner>/androidforge-build-env:latest
 #
 # Workflow:
-# 1. Acquire source ZIP (input/ dir, public URL, or GitHub Release asset)
-# 2. Extract ZIP to a clean workspace
-# 3. Detect project type (Gradle / Flutter / multi-module / etc.)
-# 4. Configure toolchain (JDK / Gradle / NDK / Flutter) based on detection
-# 5. Switch JAVA_HOME to the detected JDK version (all JDKs are in the image)
-# 6. Install ONLY missing project-specific Android SDK components
-# 7. Install NDK only if the project uses native code
-# 8. Build the project (assembleDebug / assembleRelease / bundleDebug)
-# 9. Collect generated APKs and pick the primary one
-# 10. Upload APK as a GitHub Actions artifact + publish to release
-# 11. On failure, run automated diagnosis
+#   1. Acquire source ZIP (input/ dir, public URL, or GitHub Release asset)
+#   2. Extract ZIP to a clean workspace
+#   3. Detect project type (Gradle / Flutter / multi-module / etc.)
+#   4. Configure toolchain (JDK / Gradle / NDK / Flutter) based on detection
+#   5. Switch JAVA_HOME to the detected JDK version (all JDKs are in the image)
+#   6. Install ONLY missing project-specific Android SDK components
+#   7. Install NDK only if the project uses native code
+#   8. Build the project (assembleDebug / assembleRelease / bundleDebug)
+#   9. Collect generated APKs and pick the primary one
+#  10. Upload APK as a GitHub Actions artifact + publish to release
+#  11. On failure, run automated diagnosis
 
 on:
   workflow_dispatch:
@@ -96,7 +96,7 @@ env:
 # Use the prebuilt image so we don't reinstall JDK + Android SDK + Gradle +
 # Flutter on every single build. The image is built by
 # .github/workflows/build-android-image.yml and lives at:
-# ghcr.io/<owner>/androidforge-build-env:latest
+#   ghcr.io/<owner>/androidforge-build-env:latest
 # If the image is missing (first-ever run before the image build has run),
 # this workflow will fail with a clear "image not found" error — the fix is
 # to run the "Build & Publish Android Image" workflow once.
@@ -279,7 +279,7 @@ jobs:
             /root/.gradle/caches
             /root/.gradle/wrapper
             ${{ steps.extract.outputs.project_root }}/.gradle
-          key: gradle-${{ steps.toolchain.outputs.gradle_version }}
+          key: gradle-${{ steps.toolchain.outputs.gradle_version }}-${{ hashFiles('**/build.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
           restore-keys: |
             gradle-${{ steps.toolchain.outputs.gradle_version }}-
             gradle-
@@ -326,36 +326,11 @@ jobs:
           fi
 
       # ---------------------------------------------------------------------
-      # Configure stable signing for the trusted project being built.
-      # The saved ANDROID_KEYSTORE_BASE64 secret is double-Base64 encoded
-      # by the phone workflow, so decode twice to recover the JKS keystore.
-      # ---------------------------------------------------------------------
-      - name: Configure stable APK signing
-        shell: bash
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          test -n "$KEYSTORE_B64" || { echo "::error::Missing ANDROID_KEYSTORE_BASE64 secret"; exit 1; }
-          SIGNING_DIR="$GITHUB_WORKSPACE/.androidforge-signing"
-          mkdir -p "$SIGNING_DIR"
-          chmod 700 "$SIGNING_DIR"
-          printf '%s' "$KEYSTORE_B64" | base64 --decode | base64 --decode > "$SIGNING_DIR/upload-keystore.jks"
-          chmod 600 "$SIGNING_DIR/upload-keystore.jks"
-          test -s "$SIGNING_DIR/upload-keystore.jks" || { echo "::error::Keystore file is empty"; exit 1; }
-          echo "Stable signing keystore prepared."
-
-      # ---------------------------------------------------------------------
       # Step 11: Build the project (writes build.json)
       # ---------------------------------------------------------------------
       - name: Build project
         id: build
         continue-on-error: true
-        env:
-          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/.androidforge-signing/upload-keystore.jks
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/build_project.py" \
             --root "${{ steps.extract.outputs.project_root }}" \
@@ -408,8 +383,155 @@ jobs:
           path: ${{ steps.collect.outputs.apk_directory }}/*.aab
           if-no-files-found: ignore
           retention-days: 30
-
+          
       # ---------------------------------------------------------------------
       # Step 14: ALWAYS publish APKs to a fresh output release (tag derived
       # from the run id, so the Pages UI can fetch it predictably). This
-      # step runs server-sid
+      # step runs server-side on the GitHub runner — no CORS issues, no
+      # browser uploads. The UI then fetches the release's asset list via
+      # api.github.com (CORS-enabled) and offers direct download links to
+      # the regular GitHub navigation URLs.
+      #
+      # We use the GitHub REST API directly via curl (no `gh` dependency)
+      # because the Docker image doesn't ship `gh` and installing it via
+      # apt requires a GPG key that sometimes fails to import.
+      # ---------------------------------------------------------------------
+      - name: Publish APKs to output release
+        if: always() && steps.collect.outputs.apk_count != '0' && steps.collect.outputs.apk_count != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="web-build-output-${{ github.run_id }}"
+          REPO_API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          AUTH_HEADER="Authorization: Bearer $GH_TOKEN"
+          API_VERSION="X-GitHub-Api-Version: 2022-11-28"
+          ACCEPT="Accept: application/vnd.github+json"
+
+          echo "=== Step 1: Create release with tag $TAG ==="
+          # Try to create the release; if it already exists (race with
+          # a previous attempt), we just look it up.
+          RELEASE_RESPONSE=$(curl -sS -X POST \
+            -H "$AUTH_HEADER" -H "$ACCEPT" -H "$API_VERSION" -H "Content-Type: application/json" \
+            "$REPO_API/releases" \
+            -d "{\"tag_name\":\"$TAG\",\"target_commitish\":\"main\",\"name\":\"Build #${{ github.run_number }} output\",\"body\":\"Auto-generated by AndroidForge workflow run ${{ github.run_id }}.\",\"prerelease\":true}")
+          RELEASE_ID=$(echo "$RELEASE_RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null)
+
+          if [ -z "$RELEASE_ID" ]; then
+            echo "Create-release call didn't return an id — release likely already exists. Looking it up..."
+            RELEASE_ID=$(curl -sS -H "$AUTH_HEADER" -H "$ACCEPT" -H "$API_VERSION" \
+              "$REPO_API/releases/tags/$TAG" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null)
+          fi
+
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::Could not create or find release with tag $TAG"
+            echo "Create-release response: $RELEASE_RESPONSE"
+            exit 1
+          fi
+          echo "  ✓ Release ID: $RELEASE_ID (tag: $TAG)"
+
+          echo "=== Step 2: Upload APKs/AABs to the release ==="
+          cd "$GITHUB_WORKSPACE/output"
+          shopt -s nullglob
+          UPLOADED=0
+          for f in *.apk *.aab; do
+            [ -e "$f" ] || continue
+            echo "  → Uploading $f ($(stat -c%s "$f" | awk '{printf "%.1f MB", $1/1024/1024}'))..."
+            # Upload via uploads.github.com (different host than api.github.com)
+            UPLOAD_URL="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$(basename "$f")"
+            HTTP_CODE=$(curl -sS -X POST \
+              -H "$AUTH_HEADER" -H "$ACCEPT" -H "$API_VERSION" -H "Content-Type: application/zip" \
+              --data-binary "@$f" \
+              -o /tmp/upload-response.json -w "%{http_code}" \
+              "$UPLOAD_URL")
+            if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
+              echo "    ✓ uploaded (HTTP $HTTP_CODE)"
+              UPLOADED=$((UPLOADED+1))
+            else
+              echo "    ✗ failed (HTTP $HTTP_CODE)"
+              cat /tmp/upload-response.json | head -3
+            fi
+          done
+
+          echo "=== Step 3: Surface release tag to UI + summary ==="
+          echo "output_release_tag=$TAG" >> "$GITHUB_ENV"
+          echo "output_release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 📦 Output release"
+            echo ""
+            echo "Tag: \`$TAG\`"
+            echo "URL: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            echo ""
+            echo "Assets uploaded: $UPLOADED"
+            echo ""
+            # List the assets via the API for the summary
+            curl -sS -H "$AUTH_HEADER" -H "$ACCEPT" -H "$API_VERSION" \
+              "$REPO_API/releases/$RELEASE_ID" \
+              | python3 -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          print('Assets in release:')
+          for a in d.get('assets', []):
+              print(f\"  - {a['name']} ({a['size']} bytes)\")
+              print(f\"    download: {a['browser_download_url']}\")
+          " || echo "(could not list assets)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Done. Release $TAG contains $UPLOADED asset(s)."
+
+      # ---------------------------------------------------------------------
+      # Step 15: Upload build logs (always, for debugging)
+      # ---------------------------------------------------------------------
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndroidForge-logs
+          path: |
+            .androidforge/logs/
+            ${{ steps.extract.outputs.project_root }}/build/outputs/
+            ${{ steps.extract.outputs.project_root }}/**/build/reports/
+            ${{ steps.extract.outputs.project_root }}/**/build/outputs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ---------------------------------------------------------------------
+      # Step 16: Diagnose failure (only on build failure)
+      # ---------------------------------------------------------------------
+      - name: Diagnose failure
+        if: steps.build.outputs.build_succeeded != 'true'
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/diagnose_failure.py" \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --log-dir "$GITHUB_WORKSPACE/.androidforge/logs" || true
+
+      # ---------------------------------------------------------------------
+      # Step 17: Build summary (always)
+      # ---------------------------------------------------------------------
+      - name: Build summary
+        if: always()
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/build_summary.py" \
+            --detect "$GITHUB_WORKSPACE/detection.json" \
+            --toolchain "$GITHUB_WORKSPACE/toolchain.json" \
+            --build "$GITHUB_WORKSPACE/build.json" \
+            --collect "$GITHUB_WORKSPACE/collect.json" || true
+          # Also dump the self-heal report into the workflow summary if it exists
+          if [ -f "$GITHUB_WORKSPACE/self_heal.json" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "## 🩹 Self-heal report" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat "$GITHUB_WORKSPACE/self_heal.json" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ---------------------------------------------------------------------
+      # Final: fail the job if the build itself failed
+      # ---------------------------------------------------------------------
+      - name: Fail if build failed
+        if: steps.build.outputs.build_succeeded != 'true'
+        run: |
+          echo "::error::Android build failed. See the diagnosis above and the AndroidForge-logs artifact."
+          exit 1
+
